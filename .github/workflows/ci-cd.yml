@@ -1,0 +1,239 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME_API: ${{ github.repository }}/api
+  IMAGE_NAME_WORKER: ${{ github.repository }}/worker
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1. TEST -- lint and run automated tests for API and worker, with
+  #    ephemeral Postgres/Redis containers. GitHub and Gemini calls are
+  #    mocked in the tests themselves, so nothing external is called.
+  # ---------------------------------------------------------------------
+  test-api:
+    name: Test API
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: review_bot
+          POSTGRES_PASSWORD: review_bot_test_password
+          POSTGRES_DB: review_bot_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U review_bot"
+          --health-interval 5s --health-timeout 5s --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        working-directory: ./api
+        run: pip install -r requirements.txt
+      - name: Run tests
+        working-directory: ./api
+        env:
+          DATABASE_URL: sqlite:///./test_api.db
+          REDIS_URL: redis://localhost:6379/0
+          GITHUB_WEBHOOK_SECRET: ""
+        run: pytest tests/ -v
+
+  test-worker:
+    name: Test Worker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        working-directory: ./worker
+        run: pip install -r requirements.txt
+      - name: Run tests
+        working-directory: ./worker
+        env:
+          DATABASE_URL: sqlite:///./test_worker.db
+          REDIS_URL: redis://localhost:6379/0
+          GOOGLE_API_KEY: ""
+          GITHUB_TOKEN: ""
+        run: pytest tests/ -v
+
+  # ---------------------------------------------------------------------
+  # 2. BUILD -- build both Docker images (only after tests pass), tagged
+  #    with the commit SHA for traceability, pushed to GHCR.
+  # ---------------------------------------------------------------------
+  build:
+    name: Build & Push Images
+    needs: [test-api, test-worker]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-tag: ${{ steps.meta.outputs.sha_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image tag
+        id: meta
+        run: echo "sha_tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push API image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./api
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_API }}:${{ steps.meta.outputs.sha_tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_API }}:latest
+
+      - name: Build and push Worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./worker
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_WORKER }}:${{ steps.meta.outputs.sha_tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_WORKER }}:latest
+
+  # ---------------------------------------------------------------------
+  # 3. SECURITY SCAN -- Trivy scans the built images; pipeline fails on
+  #    critical vulnerabilities before anything is deployed.
+  # ---------------------------------------------------------------------
+  security-scan:
+    name: Trivy Security Scan
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Scan API image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_API }}:${{ needs.build.outputs.image-tag }}
+          severity: "CRITICAL"
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Scan Worker image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_WORKER }}:${{ needs.build.outputs.image-tag }}
+          severity: "CRITICAL"
+          exit-code: "1"
+          ignore-unfixed: true
+
+  # ---------------------------------------------------------------------
+  # 4. STAGING DEPLOY -- deploy the freshly built + scanned images to
+  #    staging. Replace the placeholder deploy step with real commands
+  #    for your infrastructure (SSH, a cloud CLI, Kubernetes, etc).
+  # ---------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [build, security-scan]
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Deploy images to staging
+        run: |
+          echo "Deploying API image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_API }}:${{ needs.build.outputs.image-tag }}"
+          echo "Deploying Worker image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_WORKER }}:${{ needs.build.outputs.image-tag }}"
+          echo "TODO: replace this with your real deploy commands (SSH, cloud CLI, k8s, etc)."
+
+  # ---------------------------------------------------------------------
+  # 5. SMOKE TEST -- hit staging's health endpoint; stop before
+  #    production if it fails.
+  # ---------------------------------------------------------------------
+  smoke-test:
+    name: Smoke Test Staging
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check staging health endpoint
+        run: |
+          # TODO: replace with your real staging URL once it exists.
+          echo "TODO: curl --fail https://staging.example.com/health"
+
+  # ---------------------------------------------------------------------
+  # 6. MANUAL APPROVAL + PRODUCTION DEPLOY -- promotes the exact same,
+  #    already-tested image (no rebuild). The "production" environment
+  #    should have a required reviewer configured in
+  #    Settings > Environments > production on GitHub.
+  # ---------------------------------------------------------------------
+  deploy-production:
+    name: Deploy to Production
+    needs: [build, smoke-test]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Promote tested image to production
+        run: |
+          echo "Promoting API image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_API }}:${{ needs.build.outputs.image-tag }}"
+          echo "Promoting Worker image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_WORKER }}:${{ needs.build.outputs.image-tag }}"
+          echo "TODO: replace this with your real deploy commands."
+
+      - name: Post-deploy health check
+        id: prod_health
+        run: |
+          # TODO: replace with your real production URL once it exists.
+          echo "TODO: curl --fail https://production.example.com/health"
+
+  # ---------------------------------------------------------------------
+  # 7. AUTOMATIC ROLLBACK -- if the production health check fails,
+  #    redeploy the last known-good image tag.
+  # ---------------------------------------------------------------------
+  rollback:
+    name: Rollback Production
+    needs: deploy-production
+    runs-on: ubuntu-latest
+    if: failure()
+    steps:
+      - name: Redeploy last known-good image
+        run: |
+          echo "Production health check failed -- rolling back."
+          echo "TODO: redeploy the previous stable tag (e.g. the 'latest' tag from before this run)."
+
+  # ---------------------------------------------------------------------
+  # 8. NOTIFICATIONS -- report pipeline status to Slack/Discord at
+  #    key stages.
+  # ---------------------------------------------------------------------
+  notify:
+    name: Notify Slack
+    needs: [deploy-production]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack notification
+        run: |
+          if [ -z "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            echo "No SLACK_WEBHOOK_URL secret set yet -- skipping notification."
+            exit 0
+          fi
+          STATUS="${{ needs.deploy-production.result }}"
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"AI Code Review Bot pipeline finished with status: ${STATUS}\"}" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
